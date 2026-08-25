@@ -1,0 +1,26 @@
+# Controls what "gcloud run deploy --source ." uploads to Cloud Build.
+# Without this file gcloud uploads the whole directory, which would put .env
+# (with the bot token in it) into the build staging bucket.
+.gcloudignore
+.git
+.gitignore
+
+# Secrets. These belong in Secret Manager, never in a build upload.
+.env
+.env.local
+*.secret
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+tests/
+requirements-dev.txt
+telegram-code-bot-spec.md
+.vscode/
+.idea/
+*.log
+tools/

@@ -1,0 +1,18 @@
+# Secrets: the bot token, the webhook secret and the Apps Script secret live
+# here during local development and must never be committed.
+.env
+.env.local
+*.secret
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+.vscode/
+.idea/
+*.log
