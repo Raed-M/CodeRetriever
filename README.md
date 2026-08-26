@@ -50,6 +50,15 @@ tests/                   86 tests, all outbound HTTP mocked
 Everything comes from environment variables and is validated at startup; a
 missing or malformed value stops the process with a message naming it.
 
+A `.env` file next to `main.py` is read first, so `python main.py` works with no
+shell setup. **The real environment always wins over the file**, so a stray
+`.env` cannot override a secret injected by Cloud Run. `ENV_FILE` points the
+loader somewhere else; setting it empty turns the lookup off. The file is
+gitignored and excluded from both the image and the Cloud Build upload, so in
+production there is nothing to read. Passing an explicit mapping to
+`Config.from_env()` skips the file entirely, which is what keeps the tests
+hermetic.
+
 | Variable | Required | Notes |
 |---|---|---|
 | `BOT_TOKEN` | yes | from BotFather |
@@ -81,27 +90,56 @@ python -m venv .venv
 cp .env.example .env      # then fill it in; .env is gitignored
 ```
 
-Load the variables and start the dev server:
+Then just start it; the `.env` is picked up automatically:
 
 ```bash
-# bash
-set -a; . ./.env; set +a
 python main.py
 ```
 
+To override one value for a single run, set it in the shell: the environment
+takes precedence over the file.
+
+```bash
+CODE_SOURCE=appsscript python main.py     # bash
+```
+
 ```powershell
-# PowerShell
-Get-Content .env | ForEach-Object {
-  if ($_ -match '^\s*([^#=]+)=(.*)$') {
-    [Environment]::SetEnvironmentVariable($Matches[1].Trim(), $Matches[2].Trim())
-  }
-}
-python main.py
+$env:CODE_SOURCE = "appsscript"; python main.py    # PowerShell
 ```
 
 `python main.py` runs the Flask development server: threaded, bound to 0.0.0.0.
 Cloud Run runs gunicorn instead (see the Dockerfile). gunicorn does not run on
 Windows, so local runs use the dev server.
+
+### Talking to the real bot from your machine
+
+`python main.py` on its own **cannot receive anything**. Telegram delivers
+updates by POSTing to a public HTTPS URL, and a laptop has none, so the service
+starts, serves /healthz, and waits forever while messages pile up at Telegram.
+Nothing is misconfigured; there is simply no route in.
+
+Use the bridge instead. It long-polls getUpdates and hands each update to the
+local service exactly as Telegram would:
+
+```bash
+python tools/local_relay.py
+```
+
+It reads `.env`, starts `main.py` for you, honours whatever `CODE_SOURCE` says,
+and runs until Ctrl+C. Do not run `main.py` separately as well; use
+`--no-start-app` if you want to start it yourself.
+
+| Flag | Effect |
+|---|---|
+| `--stub` | force the stub source, leaving the mailbox alone |
+| `--allow ID` | whitelist a specific user instead of `ALLOWED_USER_IDS` |
+| `--no-start-app` | bridge only, to a service you started yourself |
+| `--seconds N` | stop after N seconds instead of running until Ctrl+C |
+
+While the bridge is running, the webhook must stay unregistered: Telegram will
+not serve getUpdates and a webhook at the same time. The bridge calls
+deleteWebhook at startup for that reason, so **re-run setWebhook when you go
+back to the deployed service**.
 
 ### Poking it without Telegram
 
@@ -143,12 +181,47 @@ the guarantee that no secret reaches the logs.
 
 ## Deploying to Cloud Run
 
+### Before the first deploy
+
+```bash
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+gcloud config set run/region me-central2
+
+gcloud services enable \
+  run.googleapis.com \
+  cloudbuild.googleapis.com \
+  artifactregistry.googleapis.com \
+  secretmanager.googleapis.com
+```
+
+The project needs billing enabled; Cloud Build will not run without it.
+
 Store the secrets first:
 
 ```bash
-printf '%s' 'YOUR_BOT_TOKEN'   | gcloud secrets create bot-token        --data-file=-
-printf '%s' 'YOUR_SECRET'      | gcloud secrets create webhook-secret   --data-file=-
-printf '%s' '111111,222222'    | gcloud secrets create allowed-user-ids --data-file=-
+printf '%s' 'YOUR_BOT_TOKEN'    | gcloud secrets create bot-token          --data-file=-
+printf '%s' 'YOUR_SECRET'       | gcloud secrets create webhook-secret     --data-file=-
+printf '%s' '111111,222222'     | gcloud secrets create allowed-user-ids   --data-file=-
+printf '%s' 'THE_EXEC_URL'      | gcloud secrets create apps-script-url    --data-file=-
+printf '%s' 'THE_SHARED_SECRET' | gcloud secrets create apps-script-secret --data-file=-
+```
+
+Generate a **fresh** `WEBHOOK_SECRET` for production instead of reusing the
+one in the local `.env`.
+
+The runtime service account has to be allowed to read them. Skip this and the
+deploy succeeds, then the container dies on startup:
+
+```bash
+PROJECT_NUMBER="$(gcloud projects describe "$(gcloud config get-value project)" --format='value(projectNumber)')"
+RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+for secret in bot-token webhook-secret allowed-user-ids apps-script-url apps-script-secret; do
+  gcloud secrets add-iam-policy-binding "$secret" \
+    --member="serviceAccount:${RUNTIME_SA}" \
+    --role=roles/secretmanager.secretAccessor
+done
 ```
 
 Then deploy:
@@ -162,9 +235,13 @@ gcloud run deploy telegram-code-bot \
   --min-instances=0 \
   --memory=512Mi \
   --timeout=120 \
-  --set-env-vars "CODE_SOURCE=stub,STUB_MODE=ok" \
-  --set-secrets "BOT_TOKEN=bot-token:latest,WEBHOOK_SECRET=webhook-secret:latest,ALLOWED_USER_IDS=allowed-user-ids:latest"
+  --set-env-vars "CODE_SOURCE=appsscript" \
+  --set-secrets "BOT_TOKEN=bot-token:latest,WEBHOOK_SECRET=webhook-secret:latest,ALLOWED_USER_IDS=allowed-user-ids:latest,APPS_SCRIPT_URL=apps-script-url:latest,APPS_SCRIPT_SECRET=apps-script-secret:latest"
 ```
+
+If anything misbehaves, redeploying with `--set-env-vars
+"CODE_SOURCE=stub,STUB_MODE=ok"` takes the mailbox out of the picture and
+tells you whether the problem is the Telegram half or the mail half.
 
 `--allow-unauthenticated` is required: Telegram cannot present a Google IAM
 token. The secret-token header is the real access control, with the user
@@ -206,7 +283,46 @@ curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo"
 ```
 
 A climbing pending_update_count or a last_error_message means Telegram cannot
-reach the service, or the secret does not match. To take the bot offline:
+reach the service, or the secret does not match.
+
+### If api.telegram.org does not resolve
+
+Some networks (including the one this was developed on) return NXDOMAIN for
+api.telegram.org while the route itself is open. Public resolvers answer it, so
+pin the address for the one command:
+
+Get an address from a resolver that answers:
+
+```powershell
+# PowerShell
+$TG_IP = (Resolve-DnsName api.telegram.org -Server 1.1.1.1 -Type A |
+          Where-Object IPAddress | Select-Object -First 1 -Expand IPAddress)
+```
+
+```bash
+# bash
+TG_IP="$(dig +short api.telegram.org @1.1.1.1 | head -1)"
+```
+
+Then pin it for each Telegram call:
+
+```bash
+curl -s --resolve "api.telegram.org:443:${TG_IP}" \
+  "https://api.telegram.org/bot${BOT_TOKEN}/getMe"
+```
+
+Do not parse `nslookup` output for this: it prints the resolver address first
+and may list an IPv6 record ahead of the IPv4 one.
+
+`--resolve` skips DNS but keeps SNI, the Host header and certificate
+verification on the real hostname, so TLS is still fully checked. Add the same
+flag to the setWebhook call. Google Cloud Shell is the other option: it has
+gcloud preinstalled and unfiltered DNS.
+
+This affects only the machine running these commands. Cloud Run resolves
+api.telegram.org normally, so the deployed service is unaffected.
+
+To take the bot offline:
 
 ```bash
 curl -s "https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook"

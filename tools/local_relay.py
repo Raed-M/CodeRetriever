@@ -1,18 +1,24 @@
 """Development-only bridge: real Telegram, locally running service.
 
-Cloud Run gets updates pushed to it over HTTPS. A laptop has no public URL, so
-this stands in for that hop: it long-polls getUpdates and POSTs each update to
-the local /webhook with the same secret header Telegram would send. The bot
-replies through the real Bot API, so everything except Telegram inbound HTTP
-delivery is exercised for real.
+Cloud Run gets its updates pushed to it over HTTPS. A laptop has no public URL,
+so Telegram can never reach it and running main.py on its own will sit there
+receiving nothing. This stands in for that hop: it long-polls getUpdates and
+POSTs each update to the local /webhook with the same secret header Telegram
+would send. The service replies through the real Bot API, so everything except
+Telegram inbound HTTP delivery is exercised for real.
+
+    python tools/local_relay.py
+
+It reads .env the same way the service does, starts main.py itself, and honours
+whatever CODE_SOURCE is set to. Add --stub to force the stub source instead, or
+--no-start-app to bridge to a service you started yourself.
+
+Some networks answer NXDOMAIN for api.telegram.org while the route is open; the
+address is pinned automatically when that happens, for this process and the
+service subprocess only, leaving SNI, the Host header and certificate checks on
+the real hostname.
 
 Not part of the service. Excluded from the image and the Cloud Build upload.
-
-  python tools/local_relay.py --start-app
-
---dns-override exists because some networks resolve api.telegram.org to
-nothing; it maps the name to a real Telegram address for this process only,
-leaving SNI, the Host header and certificate checks on the real hostname.
 """
 
 from __future__ import annotations
@@ -185,27 +191,78 @@ def start_app(env_extra: dict[str, str], port: int) -> subprocess.Popen:
     raise SystemExit("the service did not become healthy in time")
 
 
+def telegram_resolves() -> bool:
+    try:
+        socket.getaddrinfo("api.telegram.org", 443)
+        return True
+    except OSError:
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8088)
-    parser.add_argument("--start-app", action="store_true", help="launch main.py too")
-    parser.add_argument("--dns-override", metavar="IP", nargs="?", const="auto")
+    parser.add_argument(
+        "--no-start-app",
+        action="store_true",
+        help="relay only; assume main.py is already running on --port",
+    )
+    parser.add_argument(
+        "--dns-override",
+        metavar="IP",
+        nargs="?",
+        const="auto",
+        help="force a Telegram address; by default this is applied only when DNS fails",
+    )
+    parser.add_argument("--no-dns-override", action="store_true")
     parser.add_argument("--allow", type=int, action="append", help="whitelist this user ID")
+    parser.add_argument(
+        "--stub",
+        action="store_true",
+        help="run the service against the stub instead of whatever CODE_SOURCE says",
+    )
     parser.add_argument("--stub-mode", default="delayed")
     parser.add_argument("--stub-link", default="https://example.invalid/login/confirm?token=stub")
     parser.add_argument("--stub-delay", default="8")
-    parser.add_argument("--seconds", type=int, default=600, help="how long to relay for")
+    parser.add_argument(
+        "--seconds",
+        type=int,
+        default=0,
+        help="stop after this many seconds; 0 (the default) runs until Ctrl+C",
+    )
     args = parser.parse_args()
+    args.start_app = not args.no_start_app
 
-    token = os.environ.get("BOT_TOKEN", "").strip()
-    secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+    # Same precedence the service uses: real environment first, .env behind it.
+    sys.path.insert(0, str(ROOT))
+    from codebot.config import load_env_file
+
+    file_values = load_env_file()
+    settings = {**file_values, **os.environ}
+
+    token = (settings.get("BOT_TOKEN") or "").strip()
+    secret = (settings.get("WEBHOOK_SECRET") or "").strip()
     if not token or not secret:
-        raise SystemExit("BOT_TOKEN and WEBHOOK_SECRET must be set")
+        raise SystemExit("BOT_TOKEN and WEBHOOK_SECRET must be set, in .env or the environment")
+    # The service subprocess inherits these, so it never has to re-read the file.
+    os.environ.setdefault("BOT_TOKEN", token)
+    os.environ.setdefault("WEBHOOK_SECRET", secret)
 
-    if args.dns_override:
+    if not args.allow:
+        raw = (settings.get("ALLOWED_USER_IDS") or "").strip()
+        args.allow = [int(x) for x in raw.split(",") if x.strip()] or None
+
+    if args.no_dns_override:
+        pass
+    elif args.dns_override:
         install_dns_override(
             pick_reachable_ip() if args.dns_override == "auto" else args.dns_override
         )
+    elif not telegram_resolves():
+        # This network answers NXDOMAIN for api.telegram.org even though the
+        # route is open, so fall back to a known address rather than failing.
+        log("dns_lookup_failed", host="api.telegram.org")
+        install_dns_override(pick_reachable_ip())
 
     relay = Relay(token, secret, "http://127.0.0.1:{0}".format(args.port))
     me = relay.api("getMe").get("result", {})
@@ -214,25 +271,40 @@ def main() -> int:
     return run(relay, args)
 
 
+def app_env(args, allowed: list[int]) -> dict[str, str]:
+    """Environment for the service subprocess.
+
+    Only the whitelist is forced, so the service reads CODE_SOURCE and
+    everything else from .env exactly as it would on its own. --stub overrides
+    that for a run that must not touch the mailbox.
+    """
+    env = {"ALLOWED_USER_IDS": ",".join(str(i) for i in allowed)}
+    if args.stub:
+        env.update(
+            {
+                "CODE_SOURCE": "stub",
+                "STUB_MODE": args.stub_mode,
+                "STUB_LINK": args.stub_link,
+                "STUB_DELAY_SECONDS": args.stub_delay,
+            }
+        )
+    return env
+
+
 def run(relay: Relay, args) -> int:
     allowed = list(args.allow or [])
     app_process = None
     pending: list[dict] = []
 
     if allowed and args.start_app:
-        app_process = start_app(
-            {
-                "ALLOWED_USER_IDS": ",".join(str(i) for i in allowed),
-                "CODE_SOURCE": "stub",
-                "STUB_MODE": args.stub_mode,
-                "STUB_LINK": args.stub_link,
-                "STUB_DELAY_SECONDS": args.stub_delay,
-            },
-            args.port,
-        )
+        app_process = start_app(app_env(args, allowed), args.port)
 
-    log("waiting_for_messages", allowed=allowed or "first sender will be whitelisted")
-    deadline = time.monotonic() + args.seconds
+    log(
+        "waiting_for_messages",
+        allowed=allowed or "first sender will be whitelisted",
+        stop_with="Ctrl+C" if not args.seconds else "{0}s limit".format(args.seconds),
+    )
+    deadline = time.monotonic() + args.seconds if args.seconds else float("inf")
     try:
         while time.monotonic() < deadline:
             for update in relay.poll_once():
@@ -251,16 +323,7 @@ def run(relay: Relay, args) -> int:
                 # no user ID looked up in advance.
                 if app_process is None and args.start_app and user_id is not None:
                     allowed = [user_id]
-                    app_process = start_app(
-                        {
-                            "ALLOWED_USER_IDS": str(user_id),
-                            "CODE_SOURCE": "stub",
-                            "STUB_MODE": args.stub_mode,
-                            "STUB_LINK": args.stub_link,
-                            "STUB_DELAY_SECONDS": args.stub_delay,
-                        },
-                        args.port,
-                    )
+                    app_process = start_app(app_env(args, allowed), args.port)
                     for buffered in pending:
                         relay.deliver(buffered)
                     pending.clear()

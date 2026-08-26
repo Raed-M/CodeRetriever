@@ -1,18 +1,31 @@
 """Environment-driven configuration, validated once at startup.
 
-Every secret comes from an environment variable. There are no defaults for
-secrets and no dotenv loading: if a required variable is missing the process
-refuses to start (spec 5.5).
+Every secret comes from the environment. There are no defaults for secrets: if a
+required variable is missing the process refuses to start (spec 5.5).
+
+For convenience during local development, a .env file sitting next to main.py is
+read first. The real environment always wins over it, so a file that somehow
+reached a server could not override a secret injected there. The .env is
+gitignored and excluded from both the image and the Cloud Build upload, so in
+production there is simply no file to read.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8080
 DEFAULT_TELEGRAM_API_BASE = "https://api.telegram.org"
+
+# Next to main.py, not the working directory, so "python main.py" behaves the
+# same whichever directory it is launched from.
+DEFAULT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 VALID_CODE_SOURCES = ("appsscript", "stub")
 VALID_STUB_MODES = ("ok", "not_found", "error", "delayed")
@@ -20,6 +33,72 @@ VALID_STUB_MODES = ("ok", "not_found", "error", "delayed")
 
 class ConfigError(RuntimeError):
     """Raised at startup when the environment is not usable."""
+
+
+def parse_env_file(text: str) -> dict[str, str]:
+    """Parse KEY=VALUE lines.
+
+    Blank lines and lines starting with # are skipped, a leading "export " is
+    tolerated, and one layer of matching surrounding quotes is removed.
+
+    A # part-way through a line is NOT treated as a comment: secrets are allowed
+    to contain one, and truncating a secret silently would be far worse than
+    keeping a stray trailing comment.
+    """
+    values: dict[str, str] = {}
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not key:
+            # Line number only. The content may be a secret.
+            logger.warning(
+                "ignoring unparseable line in the env file",
+                extra={"event": "env_file_bad_line", "line_number": number},
+            )
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", chr(34)):
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def load_env_file(path: Path | None = None) -> dict[str, str]:
+    """Read a .env file if there is one. A missing file is not an error.
+
+    ENV_FILE overrides the location; setting it empty disables the lookup.
+    """
+    if path is None:
+        override = os.environ.get("ENV_FILE")
+        if override is not None:
+            if not override.strip():
+                return {}
+            path = Path(override)
+        else:
+            path = DEFAULT_ENV_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        logger.warning(
+            "could not read the env file",
+            extra={"event": "env_file_unreadable", "error_type": type(exc).__name__},
+        )
+        return {}
+    values = parse_env_file(text)
+    if values:
+        # Names only, never values.
+        logger.info(
+            "loaded local env file",
+            extra={"event": "env_file_loaded", "keys": sorted(values)},
+        )
+    return values
 
 
 @dataclass(frozen=True, repr=False)
@@ -51,7 +130,15 @@ class Config:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Config":
-        env = os.environ if env is None else env
+        """Build from the environment, or from an explicit mapping.
+
+        Passing a mapping skips the .env file entirely, which keeps tests
+        hermetic: a developer machine with a populated .env must not change what
+        the tests see.
+        """
+        if env is None:
+            # The real environment wins over the file.
+            env = {**load_env_file(), **os.environ}
         missing: list[str] = []
         problems: list[str] = []
 
